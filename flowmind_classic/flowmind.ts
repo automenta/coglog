@@ -24,14 +24,10 @@
 import http from 'http';
 import fs from 'fs/promises';
 import fsSync from 'fs';
-import path from 'path';
-import { WebSocketServer } from 'ws';
+import {WebSocketServer} from 'ws';
 import * as ds from 'datascript';
-import { v4 as uuid } from 'uuid';
-import { ChatOllama } from "@langchain/community/chat_models/ollama";
-import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
-import { MemoryVectorStore } from "@langchain/community/vectorstores/memory";
-import { Document } from "@langchain/core/documents";
+import {v4 as uuid} from 'uuid';
+import {ChatOllama} from "@langchain/community/chat_models/ollama";
 
 // --- Port and File Paths ---
 const HTTP_PORT = 3000;
@@ -48,26 +44,87 @@ namespace Types {
     export type Term = { kind: TermKind; name?: string; args?: Term[]; elements?: Term[] };
     export type Truth = { pos: number; neg: number };
     export type Goal = { value: number; source: string; time: Date };
-    export enum Status { PENDING = ':flowmind.status/pending', ACTIVE = ':flowmind.status/active', WAITING = ':flowmind.status/waiting', DONE = ':flowmind.status/done', FAILED = ':flowmind.status/failed' }
+
+    export enum Status {
+        PENDING = ':flowmind.status/pending',
+        ACTIVE = ':flowmind.status/active',
+        WAITING = ':flowmind.status/waiting',
+        DONE = ':flowmind.status/done',
+        FAILED = ':flowmind.status/failed'
+    }
+
     export type StatusValue = `${Status}`;
-    export type Thought = { ':db/id'?: number; uuid: UUID; content: Term; contentRef?: number; truth: Truth; goal: Goal; status: StatusValue; meta: Map<string, any>; createdAt: Date; modifiedAt: Date; };
-    export type Rule = { ':db/id'?: number; uuid: UUID; head: Term; headRef?: number; body: Term[]; bodyRefs?: number[]; truth: Truth; meta: Map<string, any>; createdAt: Date; modifiedAt: Date; };
-    export type Action = { type: 'tool' | 'memory' | 'log' | 'websocket'; // Added 'websocket'
-        name?: string; params?: Term; context: { triggerUUID: UUID; waitingThoughtUUID?: UUID; resultBindingVar?: string; ruleUUID?: UUID; };
+    export type Thought = {
+        ':db/id'?: number;
+        uuid: UUID;
+        content: Term;
+        contentRef?: number;
+        truth: Truth;
+        goal: Goal;
+        status: StatusValue;
+        meta: Map<string, any>;
+        createdAt: Date;
+        modifiedAt: Date;
+    };
+    export type Rule = {
+        ':db/id'?: number;
+        uuid: UUID;
+        head: Term;
+        headRef?: number;
+        body: Term[];
+        bodyRefs?: number[];
+        truth: Truth;
+        meta: Map<string, any>;
+        createdAt: Date;
+        modifiedAt: Date;
+    };
+    export type Action = {
+        type: 'tool' | 'memory' | 'log' | 'websocket'; // Added 'websocket'
+        name?: string;
+        params?: Term;
+        context: { triggerUUID: UUID; waitingThoughtUUID?: UUID; resultBindingVar?: string; ruleUUID?: UUID; };
         // For websocket actions
-        wsMessageType?: string; wsClientId?: string; wsPayload?: any;
+        wsMessageType?: string;
+        wsClientId?: string;
+        wsPayload?: any;
     };
     export type Event = { ':db/id'?: number; uuid: UUID; targetUUID?: UUID; type: string; data: any; time: Date; };
-    export interface Tool { execute(params: Term): Promise<Term>; }
-    export interface Config { llmEndpoint: string; ollamaModel: string; vectorStore: 'memory'; autoSaveInterval: number; }
+
+    export interface Tool {
+        execute(params: Term): Promise<Term>;
+    }
+
+    export interface Config {
+        llmEndpoint: string;
+        ollamaModel: string;
+        vectorStore: 'memory';
+        autoSaveInterval: number;
+    }
+
     // Simplified Thought representation for sending over WebSocket
-    export type ClientThought = { uuid: UUID; contentStr: string; status: string; goalValue: number; goalSource: string; createdAt: string; meta?: Record<string, any> };
-     // Prompt structure for client
-     export type ClientPrompt = { promptId: UUID; text: string; waitingThoughtUUID: UUID };
+    export type ClientThought = {
+        uuid: UUID;
+        contentStr: string;
+        status: string;
+        goalValue: number;
+        goalSource: string;
+        createdAt: string;
+        meta?: Record<string, any>
+    };
+    // Prompt structure for client
+    export type ClientPrompt = { promptId: UUID; text: string; waitingThoughtUUID: UUID };
 }
 
 // ======== Global Constants (Copied) ========
-const META_KEYS = { UI_PROMPT_TEXT: ':flowmind.meta.key/ui_prompt_text', WAITING_FOR_USER_INPUT: ':flowmind.meta.key/waiting_for_user_input', PARENT_UUID: ':flowmind.meta.key/parent_uuid', SOURCE_RULE_UUID: ':flowmind.meta.key/source_rule_uuid', TOOL_RESULT_FOR: ':flowmind.meta.key/tool_result_for', RESPONSE_TO_PROMPT: ':flowmind.meta.key/responded_to_prompt', EMBEDDING_VECTOR: ':flowmind.meta.key/embedding_vector' };
+const META_KEYS = {
+    UI_PROMPT_TEXT: ':flowmind.meta.key/ui_prompt_text',
+    WAITING_FOR_USER_INPUT: ':flowmind.meta.key/waiting_for_user_input',
+    PARENT_UUID: ':flowmind.meta.key/parent_uuid',
+    SOURCE_RULE_UUID: ':flowmind.meta.key/source_rule_uuid',
+    TOOL_RESULT_FOR: ':flowmind.meta.key/tool_result_for',
+    RESPONSE_TO_PROMPT: ':flowmind.meta.key/responded_to_prompt',
+    EMBEDDING_VECTOR: ':flowmind.meta.key/embedding_vector'
+};
 
 // ======== Configuration (Server-side) ========
 let config: Types.Config = {
@@ -78,6 +135,8 @@ let config: Types.Config = {
 };
 import Term = Types.Term;
 import DBInterface = Database.DBInterface;
+import InferenceEngine = Engine.InferenceEngine;
+import Status = Types.Status;
 
 namespace TermUtils {
 
@@ -106,7 +165,7 @@ namespace TermUtils {
                 };
             case 'atom':
             case 'var':
-                return { kind, name };
+                return {kind, name};
             default:
                 console.warn("Unknown term kind:", kind, entity);
                 return null; // Or throw error
@@ -117,40 +176,43 @@ namespace TermUtils {
     export const termToTransactionData = (term: Term): { tx: any[], rootId: any } => {
         const rootId = ds.tempid('term');
         let tx: any[] = [];
-        const base = { ':db/id': rootId, ':term/kind': `:flowmind.term/${term.kind}` };
+        const base = {':db/id': rootId, ':term/kind': `:flowmind.term/${term.kind}`};
 
         switch (term.kind) {
             case 'struct':
                 const argsData = (term.args ?? []).map(arg => termToTransactionData(arg));
                 tx = argsData.flatMap(d => d.tx);
-                tx.push({ ...base, ':term/name': term.name, ':term/args': argsData.map(d => d.rootId) });
+                tx.push({...base, ':term/name': term.name, ':term/args': argsData.map(d => d.rootId)});
                 break;
             case 'list':
                 const elementsData = (term.elements ?? []).map(el => termToTransactionData(el));
                 tx = elementsData.flatMap(d => d.tx);
-                tx.push({ ...base, ':term/elements': elementsData.map(d => d.rootId) });
+                tx.push({...base, ':term/elements': elementsData.map(d => d.rootId)});
                 break;
             case 'atom':
             case 'var':
-                tx.push({ ...base, ':term/name': term.name });
+                tx.push({...base, ':term/name': term.name});
                 break;
         }
-        return { tx, rootId };
+        return {tx, rootId};
     };
 
     /** Pretty prints a term. */
     export const formatTerm = (term: Term | null): string => {
         if (!term) return 'null';
         switch (term.kind) {
-            case 'atom': return term.name ?? 'nil';
-            case 'var': return `?${term.name ?? 'unnamed'}`;
+            case 'atom':
+                return term.name ?? 'nil';
+            case 'var':
+                return `?${term.name ?? 'unnamed'}`;
             case 'struct':
                 const argsStr = (term.args ?? []).map(formatTerm).join(', ');
                 return `${term.name ?? 'anon_struct'}(${argsStr})`;
             case 'list':
                 const elsStr = (term.elements ?? []).map(formatTerm).join(', ');
                 return `[${elsStr}]`;
-            default: return 'invalid_term';
+            default:
+                return 'invalid_term';
         }
     };
 
@@ -175,22 +237,22 @@ namespace TermUtils {
         const term2 = resolve(t2, bindings);
 
         if (term1.kind === 'var' && term1.name) {
-            if (term1.name === term2.name && term1.kind === term2.kind) return { success: true, bindings }; // Var equals itself
+            if (term1.name === term2.name && term1.kind === term2.kind) return {success: true, bindings}; // Var equals itself
             const newBindings = new Map(bindings);
             newBindings.set(term1.name, term2);
-            return { success: true, bindings: newBindings };
+            return {success: true, bindings: newBindings};
         }
         if (term2.kind === 'var' && term2.name) {
             // Already handled t1 being a var, so t1 is not a var here
             const newBindings = new Map(bindings);
             newBindings.set(term2.name, term1);
-            return { success: true, bindings: newBindings };
+            return {success: true, bindings: newBindings};
         }
 
         if (term1.kind !== term2.kind) return null; // Different kinds
 
         if (term1.kind === 'atom') {
-            return term1.name === term2.name ? { success: true, bindings } : null;
+            return term1.name === term2.name ? {success: true, bindings} : null;
         }
 
         if (term1.kind === 'struct') {
@@ -201,7 +263,7 @@ namespace TermUtils {
                 if (!result) return null;
                 currentBindings = result.bindings;
             }
-            return { success: true, bindings: currentBindings };
+            return {success: true, bindings: currentBindings};
         }
 
         if (term1.kind === 'list') {
@@ -212,7 +274,7 @@ namespace TermUtils {
                 if (!result) return null;
                 currentBindings = result.bindings;
             }
-            return { success: true, bindings: currentBindings };
+            return {success: true, bindings: currentBindings};
         }
 
         console.error("Unhandled unification case:", term1, term2);
@@ -226,64 +288,79 @@ namespace TermUtils {
             return substitute(bindings.get(term.name)!, bindings);
         }
         if (term.kind === 'struct' && term.args) {
-            return { ...term, args: term.args.map(arg => substitute(arg, bindings)) };
+            return {...term, args: term.args.map(arg => substitute(arg, bindings))};
         }
         if (term.kind === 'list' && term.elements) {
-            return { ...term, elements: term.elements.map(el => substitute(el, bindings)) };
+            return {...term, elements: term.elements.map(el => substitute(el, bindings))};
         }
         return term; // Atoms or unbound vars
     };
 }
 
 
-// ======== Database (Adapted for Server) ========
 namespace Database {
-    const dbSchema = { /* ... (copy schema from previous version) ... */ };
+    const dbSchema = { /* ... (copy schema from previous version) ... */};
 
     export class DBInterface {
         private db: any;
         private history: any[][] = [];
+
         // Removed listeners - communication handled by explicit WebSocket pushes
 
         constructor() {
-            this.db = ds.default.empty_db(dbSchema); }
+            this.db = ds.default.empty_db(dbSchema);
+        }
 
         transact(tx: any[]) {
-             if (!tx || tx.length === 0) return null;
-             const now = new Date();
-             // Add timestamps (same logic as before)
-             const txWithTimestamps = tx.map(t => { /* ... */ });
-             try {
-                 const report = ds.transact(this.db, txWithTimestamps);
-                 if (report) {
-                     this.db = report.db_after;
-                     this.history.push(tx);
-                     if (this.history.length > 100) this.history.shift();
-                     // --- Trigger WebSocket Update ---
-                     broadcastStateUpdate(); // Notify clients AFTER transaction
-                     return report;
-                 }
-                 return null;
-             } catch (e: any) { /* ... error logging ... */ return null; }
+            if (!tx || tx.length === 0) return null;
+            const now = new Date();
+            // Add timestamps (same logic as before)
+            const txWithTimestamps = tx.map(t => { /* ... */
+            });
+            try {
+                const report = ds.transact(this.db, txWithTimestamps);
+                if (report) {
+                    this.db = report.db_after;
+                    this.history.push(tx);
+                    if (this.history.length > 100) this.history.shift();
+                    // --- Trigger WebSocket Update ---
+                    broadcastStateUpdate(); // Notify clients AFTER transaction
+                    return report;
+                }
+                return null;
+            } catch (e: any) { /* ... error logging ... */
+                return null;
+            }
         }
 
         undo() {
             if (!this.history.length) return;
             this.history.pop();
             let tempDb = ds.empty_db(dbSchema);
-            this.history.forEach(tx => { /* ... replay logic ... */ });
+            this.history.forEach(tx => { /* ... replay logic ... */
+            });
             this.db = tempDb;
             broadcastStateUpdate(); // Notify clients after undo
         }
 
-        query(q: string, ...args: any[]): any[] { /* ... implementation ... */ }
-        pull(id: any, pattern: string): any | null { /* ... implementation ... */ }
-        pullMany(ids: any[], pattern: string): (any | null)[] { /* ... implementation ... */ }
-        findEntityIdByAttribute(attribute: string, value: any): number | null { /* ... implementation ... */ }
+        query(q: string, ...args: any[]): any[] { /* ... implementation ... */
+        }
+
+        pull(id: any, pattern: string): any | null { /* ... implementation ... */
+        }
+
+        pullMany(ids: any[], pattern: string): (any | null)[] { /* ... implementation ... */
+        }
+
+        findEntityIdByAttribute(attribute: string, value: any): number | null { /* ... implementation ... */
+        }
 
         // Keep static helpers: buildMetaTx, parseMeta
-        static buildMetaTx(meta: Map<string, any>): { tx: any[], refs: any[] } { /* ... */ }
-        static parseMeta(metaEntities: any[]): Map<string, any> { /* ... */ }
+        static buildMetaTx(meta: Map<string, any>): { tx: any[], refs: any[] } { /* ... */
+        }
+
+        static parseMeta(metaEntities: any[]): Map<string, any> { /* ... */
+        }
 
 
         // --- Persistence ---
@@ -298,46 +375,147 @@ namespace Database {
         }
 
         async load(filePath: string): Promise<boolean> {
-             try {
-                 if (!fsSync.existsSync(filePath)) {
-                     console.log(`Database file ${filePath} not found. Starting fresh.`);
-                     return false; // Indicate no file was loaded
-                 }
-                 const json = await fs.readFile(filePath, 'utf-8');
-                 this.db = ds.json_to_db(JSON.parse(json), dbSchema);
-                 this.history = []; // Reset history after load
-                 console.log(`Database loaded from ${filePath}`);
-                 // No broadcast here, typically done after initial load sequence
-                 return true;
-             } catch (e: any) {
-                 console.error(`Error loading database from ${filePath}:`, e.message);
-                 this.db = ds.default.empty_db(dbSchema); // Reset on error
-                 return false;
-             }
+            try {
+                if (!fsSync.existsSync(filePath)) {
+                    console.log(`Database file ${filePath} not found. Starting fresh.`);
+                    return false; // Indicate no file was loaded
+                }
+                const json = await fs.readFile(filePath, 'utf-8');
+                this.db = ds.json_to_db(JSON.parse(json), dbSchema);
+                this.history = []; // Reset history after load
+                console.log(`Database loaded from ${filePath}`);
+                // No broadcast here, typically done after initial load sequence
+                return true;
+            } catch (e: any) {
+                console.error(`Error loading database from ${filePath}:`, e.message);
+                this.db = ds.default.empty_db(dbSchema); // Reset on error
+                return false;
+            }
         }
     }
 }
 
-// ======== Tools (Adapted for Server) ========
 namespace Tools {
     import Term = Types.Term;
     import Tool = Types.Tool;
     import Config = Types.Config;
     import DBInterface = Database.DBInterface;
-    import Action = Types.Action; // Import Action type
 
     // Keep LLMTool, MemoryTool, GoalProposalTool mostly as before
-    export class LLMTool implements Tool { /* ... implementation ... */ }
-    export class MemoryTool implements Tool { /* ... implementation ... */ }
-    export class GoalProposalTool implements Tool { /* ... implementation ... */ }
+    export class LLMTool implements Tool {
+        constructor(private config: Config) {
+        }
+
+        async execute({kind, name, args = []}: Term): Promise<Term> {
+            if (kind !== 'struct' || !name) return {kind: 'atom', name: 'error'};
+            const llm = new ChatOllama({baseUrl: this.config.llmEndpoint});
+            const [content] = args;
+            try {
+                if (name === 'generate') {
+                    const resp = await llm.invoke(`Generate a goal for: ${content.name || 'unknown'}`);
+                    return {kind: 'struct', name: 'goal', args: [{kind: 'atom', name: resp.text.trim()}]};
+                }
+                if (name === 'embed') {
+                    const embedding = await llm.embedQuery(content.name || '');
+                    return {kind: 'list', elements: embedding.map((n: number) => ({kind: 'atom', name: n.toString()}))};
+                }
+                if (name === 'synthesize_rule') {
+                    const resp = await llm.invoke(`Synthesize a rule for thought: ${content.name || 'unknown'}`);
+                    return {kind: 'struct', name: 'rule', args: [{kind: 'atom', name: resp.text.trim()}]};
+                }
+            } catch (e) {
+                console.error('LLM error:', e);
+                return {kind: 'atom', name: 'error'};
+            }
+            return {kind: 'atom', name: 'unsupported'};
+        }
+    }
+
+    export class MemoryTool implements Tool {
+        private store: any;
+
+        constructor() {
+            this.store = new VectorStore({provider: 'memory'});
+        }
+
+        async execute({kind, name, args = []}: Term): Promise<Term> {
+            if (kind !== 'struct' || !name) return {kind: 'atom', name: 'error'};
+            try {
+                if (name === 'add') {
+                    const [, embedding, content] = args;
+                    await this.store.add({
+                        id: args[0].name,
+                        embedding: embedding.elements?.map(e => parseFloat(e.name || '0')),
+                        metadata: {content: content.name}
+                    });
+                    return {kind: 'atom', name: 'ok'};
+                }
+                if (name === 'search') {
+                    const [embedding] = args;
+                    const results = await this.store.query(embedding.elements?.map(e => parseFloat(e.name || '0')), 3);
+                    return {
+                        kind: 'list',
+                        elements: results.map((r: any) => ({kind: 'atom', name: r.metadata.content}))
+                    };
+                }
+            } catch (e) {
+                console.error('Memory error:', e);
+                return {kind: 'atom', name: 'error'};
+            }
+            return {kind: 'atom', name: 'unsupported'};
+        }
+    }
+
+    export class GoalProposalTool implements Tool {
+        constructor(private config: Config) {
+        }
+
+        async execute({kind, name, args = []}: Term): Promise<Term> {
+            if (kind !== 'struct' || name !== 'suggest') return {kind: 'atom', name: 'error'};
+            const llm = new ChatOllama({baseUrl: this.config.llmEndpoint});
+            try {
+                const context = args[0]?.name || 'general';
+                const resp = await llm.invoke(`Suggest a goal based on: ${context}`);
+                return {
+                    kind: 'list',
+                    elements: [{kind: 'struct', name: 'goal', args: [{kind: 'atom', name: resp.text.trim()}]}]
+                };
+            } catch (e) {
+                console.error('Goal proposal error:', e);
+                return {kind: 'atom', name: 'error'};
+            }
+        }
+    }
+
+    export class CollaborationTool implements Tool {
+        private socket: any;
+
+        constructor() {
+            this.socket = io('http://localhost:3000');
+        } // Placeholder
+        async execute({kind, name, args = []}: Term): Promise<Term> {
+            if (kind !== 'struct' || name !== 'send' || !args[0].name || !args[1].name) return {
+                kind: 'atom',
+                name: 'error'
+            };
+            try {
+                this.socket.emit('thought', {target: args[0].name, thought: args[1].name});
+                return {kind: 'atom', name: 'ok'};
+            } catch (e) {
+                console.error('Collaboration error:', e);
+                return {kind: 'atom', name: 'error'};
+            }
+        }
+    }
 
     // --- Redesigned UserInteractionTool ---
     export class UserInteractionTool implements Tool {
-        constructor(private actionHandler: ActionHandler.AH) {} // Inject ActionHandler
+        constructor(private actionHandler: ActionHandler.AH) {
+        } // Inject ActionHandler
 
         async execute(params: Term): Promise<Term> {
             if (params.kind !== 'struct' || params.name !== 'prompt' || !params.args || params.args.length === 0 || params.args[0].kind !== 'atom' || !params.args[0].name) {
-                return { kind: 'atom', name: 'error:invalid_prompt_params' };
+                return {kind: 'atom', name: 'error:invalid_prompt_params'};
             }
             const promptText = params.args[0].name;
             const promptThoughtUUID = uuid(); // This ID represents the *request* for input
@@ -348,32 +526,36 @@ namespace Tools {
             // The ActionHandler will manage sending the request and waiting for the response.
             // We need context: which thought triggered this and is now waiting?
             // This context MUST be provided by the Engine when calling the tool op.
-             // Let's assume the context includes the waitingThoughtUUID
-             // The tool itself doesn't know which thought is waiting, the caller (engine/action handler) must manage this state.
+            // Let's assume the context includes the waitingThoughtUUID
+            // The tool itself doesn't know which thought is waiting, the caller (engine/action handler) must manage this state.
 
-             // This tool's *direct* execution result is just an indicator that the prompt process has started.
-             // The actual user response will come back asynchronously via WebSocket message handling.
-             // The primary role here is signalling the *need* for input. The ActionHandler or Engine must
-             // manage the waiting state and response correlation.
-             // Let's return the prompt request UUID.
-            return { kind: 'atom', name: promptThoughtUUID };
+            // This tool's *direct* execution result is just an indicator that the prompt process has started.
+            // The actual user response will come back asynchronously via WebSocket message handling.
+            // The primary role here is signalling the *need* for input. The ActionHandler or Engine must
+            // manage the waiting state and response correlation.
+            // Let's return the prompt request UUID.
+            return {kind: 'atom', name: promptThoughtUUID};
         }
     }
 
     // Tool Registry (Adapted)
     export class ToolRegistry {
         private tools: Map<string, Tool>;
+
         constructor(cfg: Config, db: DBInterface, actionHandler: ActionHandler.AH) {
-             this.tools = new Map<string, Tool>([
+            this.tools = new Map<string, Tool>([
                 ['llm', new LLMTool(cfg)],
                 ['memory', new MemoryTool(cfg)], // Pass config
-                 ['user_interaction', new UserInteractionTool(actionHandler)], // Inject ActionHandler
+                ['user_interaction', new UserInteractionTool(actionHandler)], // Inject ActionHandler
                 ['goal_proposal', new GoalProposalTool(cfg)], // Pass config
                 // No CollaborationTool for now
             ]);
-             console.log("ToolRegistry initialized with:", Array.from(this.tools.keys()));
+            console.log("ToolRegistry initialized with:", Array.from(this.tools.keys()));
         }
-        get(name: string): Tool | undefined { return this.tools.get(name); }
+
+        get(name: string): Tool | undefined {
+            return this.tools.get(name);
+        }
     }
 }
 
@@ -381,93 +563,111 @@ namespace Tools {
 // ======== Engine (Adapted for Server) ========
 namespace Engine {
     import Term = Types.Term;
-    import Rule = Types.Rule;
     import Action = Types.Action;
     import Status = Types.Status;
     import DBInterface = Database.DBInterface;
 
     export class InferenceEngine {
-        constructor(private db: DBInterface) {}
+        constructor(private db: DBInterface) {
+        }
 
         infer(triggerThoughtUUID: Types.UUID): { transactionData: any[]; actions: Action[] } | null {
             // ... (Keep the main infer logic from the previous refactored version) ...
             // It should query the DB, find rules, select one, and call executeOps.
             // The key is that executeOps now might generate 'websocket' actions.
-             const thoughtEid = this.db.findEntityIdByAttribute('uuid', triggerThoughtUUID);
-             // ... rest of the checks and rule finding logic ...
+            const thoughtEid = this.db.findEntityIdByAttribute('uuid', triggerThoughtUUID);
+            // ... rest of the checks and rule finding logic ...
 
-             const { tx: opTx, actions: opActions } = this.executeOps(bodyOpTerms, bindings, triggerThoughtUUID, ruleUUID);
+            const {tx: opTx, actions: opActions} = this.executeOps(bodyOpTerms, bindings, triggerThoughtUUID, ruleUUID);
 
-             // ... rest of the logic to update thought status, log events, update rule truth ...
-             return { transactionData: finalTx, actions: opActions };
+            // ... rest of the logic to update thought status, log events, update rule truth ...
+            return {transactionData: finalTx, actions: opActions};
         }
 
-        private selectRule(matches: any[]): any { /* ... implementation ... */ }
+        private selectRule(matches: any[]): any { /* ... implementation ... */
+        }
 
         // --- Modified executeOps to potentially handle WebSocket actions ---
-        private executeOps(ops: Term[], bindings: Map<string, Term>, triggerUUID: Types.UUID, ruleUUID: Types.UUID): { tx: any[]; actions: Action[] } {
-             const tx: any[] = [];
-             const actions: Action[] = [];
-             let currentBindings = new Map(bindings);
+        private executeOps(ops: Term[], bindings: Map<string, Term>, triggerUUID: Types.UUID, ruleUUID: Types.UUID): {
+            tx: any[];
+            actions: Action[]
+        } {
+            const tx: any[] = [];
+            const actions: Action[] = [];
+            let currentBindings = new Map(bindings);
 
-             for (const opTerm of ops) {
-                 const op = TermUtils.substitute(opTerm, currentBindings);
-                 if (op.kind !== 'struct' || !op.name || !op.args) continue;
+            for (const opTerm of ops) {
+                const op = TermUtils.substitute(opTerm, currentBindings);
+                if (op.kind !== 'struct' || !op.name || !op.args) continue;
 
-                 // --- op:tool ---
-                 if (op.name === 'op:tool' && op.args.length >= 2 /*...*/) {
-                     const toolName = op.args[0].name!;
-                     const toolParams = op.args[1];
-                     const resultVar = op.args[2]?.kind === 'var' ? op.args[2].name : undefined;
+                // --- op:tool ---
+                if (op.name === 'op:tool' && op.args.length >= 2 /*...*/) {
+                    const toolName = op.args[0].name!;
+                    const toolParams = op.args[1];
+                    const resultVar = op.args[2]?.kind === 'var' ? op.args[2].name : undefined;
 
-                     // --- Special Handling for User Interaction ---
-                     if (toolName === 'user_interaction' && toolParams.name === 'prompt' && toolParams.args?.[0]?.kind === 'atom') {
-                         const promptText = toolParams.args[0].name!;
-                         const promptId = uuid(); // ID for this specific prompt request
+                    // --- Special Handling for User Interaction ---
+                    if (toolName === 'user_interaction' && toolParams.name === 'prompt' && toolParams.args?.[0]?.kind === 'atom') {
+                        const promptText = toolParams.args[0].name!;
+                        const promptId = uuid(); // ID for this specific prompt request
 
-                         console.log(`Engine: Enqueuing user input request (id: ${promptId.substring(0,8)})`);
-                         // Action to send request via WebSocket
-                         actions.push({
-                             type: 'websocket', // New action type
-                             wsMessageType: 'request_user_input',
-                             wsPayload: { promptId, text: promptText, waitingThoughtUUID: triggerUUID },
-                             context: { triggerUUID, ruleUUID }
-                         });
-                         // Mark the triggering thought as waiting for the response
-                         tx.push({ ':db/id': this.db.findEntityIdByAttribute('uuid', triggerUUID), ':thought/status': Status.WAITING });
+                        console.log(`Engine: Enqueuing user input request (id: ${promptId.substring(0, 8)})`);
+                        // Action to send request via WebSocket
+                        actions.push({
+                            type: 'websocket', // New action type
+                            wsMessageType: 'request_user_input',
+                            wsPayload: {promptId, text: promptText, waitingThoughtUUID: triggerUUID},
+                            context: {triggerUUID, ruleUUID}
+                        });
+                        // Mark the triggering thought as waiting for the response
+                        tx.push({
+                            ':db/id': this.db.findEntityIdByAttribute('uuid', triggerUUID),
+                            ':thought/status': Status.WAITING
+                        });
 
-                     } else {
-                         // Normal tool action (LLM, Memory, etc.)
-                         actions.push({
-                             type: 'tool',
-                             name: toolName,
-                             params: toolParams,
-                             context: { triggerUUID, ruleUUID, resultBindingVar: resultVar, waitingThoughtUUID: resultVar ? triggerUUID : undefined }
-                         });
-                         if (resultVar) {
-                             tx.push({ ':db/id': this.db.findEntityIdByAttribute('uuid', triggerUUID), ':thought/status': Status.WAITING });
-                         }
-                     }
-                 }
-                 // --- op:add_thought ---
-                 else if (op.name === 'op:add_thought' /*...*/) { /* ... implementation ... */ }
-                 // --- op:set ---
-                 else if (op.name === 'op:set' /*...*/) { /* ... implementation ... */ }
-                 // --- op:log ---
-                 else if (op.name === 'op:log' /*...*/) { /* ... implementation ... */ }
-                 else { /* ... unknown operation logging ... */ }
-             }
-             return { tx, actions };
+                    } else {
+                        // Normal tool action (LLM, Memory, etc.)
+                        actions.push({
+                            type: 'tool',
+                            name: toolName,
+                            params: toolParams,
+                            context: {
+                                triggerUUID,
+                                ruleUUID,
+                                resultBindingVar: resultVar,
+                                waitingThoughtUUID: resultVar ? triggerUUID : undefined
+                            }
+                        });
+                        if (resultVar) {
+                            tx.push({
+                                ':db/id': this.db.findEntityIdByAttribute('uuid', triggerUUID),
+                                ':thought/status': Status.WAITING
+                            });
+                        }
+                    }
+                }
+                // --- op:add_thought ---
+                else if (op.name === 'op:add_thought' /*...*/) { /* ... implementation ... */
+                }
+                // --- op:set ---
+                else if (op.name === 'op:set' /*...*/) { /* ... implementation ... */
+                }
+                // --- op:log ---
+                else if (op.name === 'op:log' /*...*/) { /* ... implementation ... */
+                } else { /* ... unknown operation logging ... */
+                }
+            }
+            return {tx, actions};
         }
 
-        private createEventTx(targetUUID: Types.UUID | null, type: string, data: any): any { /* ... */ }
+        private createEventTx(targetUUID: Types.UUID | null, type: string, data: any): any { /* ... */
+        }
     }
 }
 
 
 namespace ActionHandler {
     import Action = Types.Action;
-    import Term = Types.Term;
     import ToolRegistry = Tools.ToolRegistry;
     import DBInterface = Database.DBInterface;
     import Status = Types.Status;
@@ -479,7 +679,8 @@ namespace ActionHandler {
         private queue: Action[] = [];
         private processing: boolean = false;
 
-        constructor(private db: DBInterface, private tools: ToolRegistry) {}
+        constructor(private db: DBInterface, private tools: ToolRegistry) {
+        }
 
         enqueue(actions: Action[]) {
             if (!actions || actions.length === 0) return;
@@ -489,12 +690,12 @@ namespace ActionHandler {
 
         // --- Called by WebSocket server when user response arrives ---
         async handleUserInputResponse(promptId: Types.UUID, responseText: string) {
-            console.log(`ActionHandler: Received response for prompt ${promptId.substring(0,8)}`);
+            console.log(`ActionHandler: Received response for prompt ${promptId.substring(0, 8)}`);
             if (!pendingPrompts.has(promptId)) {
                 console.warn(`ActionHandler: Received response for unknown/expired promptId: ${promptId}`);
                 return;
             }
-            const { waitingThoughtUUID, ruleUUID } = pendingPrompts.get(promptId)!;
+            const {waitingThoughtUUID, ruleUUID} = pendingPrompts.get(promptId)!;
             pendingPrompts.delete(promptId); // Consume the prompt
 
             const waitingThoughtEid = this.db.findEntityIdByAttribute('uuid', waitingThoughtUUID);
@@ -505,7 +706,7 @@ namespace ActionHandler {
 
             // Create a new thought for the user's response
             const responseThoughtUUID = uuid();
-            const responseTermData = TermUtils.termToTransactionData({ kind: 'atom', name: responseText });
+            const responseTermData = TermUtils.termToTransactionData({kind: 'atom', name: responseText});
             const responseMeta = new Map<string, any>([
                 [META_KEYS.RESPONSE_TO_PROMPT, promptId], // Link to the prompt *request* ID
                 [META_KEYS.PARENT_UUID, waitingThoughtUUID] // Link to the thought that was waiting
@@ -515,8 +716,13 @@ namespace ActionHandler {
             const newThoughtTx = [
                 ...responseTermData.tx,
                 ...metaTxData.tx,
-                { ':db/id': ds.tempid('goal'), ':goal/value': 0.8, ':goal/source': 'user_response', ':goal/time': new Date() },
-                { ':db/id': ds.tempid('truth'), ':truth/pos': 1, ':truth/neg': 0 },
+                {
+                    ':db/id': ds.tempid('goal'),
+                    ':goal/value': 0.8,
+                    ':goal/source': 'user_response',
+                    ':goal/time': new Date()
+                },
+                {':db/id': ds.tempid('truth'), ':truth/pos': 1, ':truth/neg': 0},
                 {
                     ':db/id': ds.tempid('thought'),
                     uuid: responseThoughtUUID,
@@ -527,7 +733,7 @@ namespace ActionHandler {
                     createdAt: new Date(), modifiedAt: new Date(),
                 },
                 // Reactivate the waiting thought
-                { ':db/id': waitingThoughtEid, ':thought/status': Status.PENDING, modifiedAt: new Date() }
+                {':db/id': waitingThoughtEid, ':thought/status': Status.PENDING, modifiedAt: new Date()}
             ];
             this.db.transact(newThoughtTx); // This will trigger broadcast update
         }
@@ -552,21 +758,26 @@ namespace ActionHandler {
                                 });
                                 // Broadcast to *all* connected clients (simplest approach)
                                 // A specific client ID could be added to action.context if needed
-                                broadcastMessage({ type: action.wsMessageType, payload: action.wsPayload });
+                                broadcastMessage({type: action.wsMessageType, payload: action.wsPayload});
                             } else {
                                 console.warn("Unhandled websocket action:", action);
                             }
                             break;
-                        case 'log': /* ... logging ... */ break;
-                        default: /* ... unknown action ... */ break;
+                        case 'log': /* ... logging ... */
+                            break;
+                        default: /* ... unknown action ... */
+                            break;
                     }
                 } catch (error: any) {
                     console.error(`ActionHandler: Error processing action: ${error.message}`, action);
-                    this.logEvent(action.context.triggerUUID, ':flowmind.event.type/action_handler_error', { actionType: action.type, error: error.message });
+                    this.logEvent(action.context.triggerUUID, ':flowmind.event.type/action_handler_error', {
+                        actionType: action.type,
+                        error: error.message
+                    });
                     // Handle failure (e.g., mark waiting thought as FAILED)
                     if ((action.type === 'tool' || action.type === 'websocket') && action.context.waitingThoughtUUID) {
                         const waitingEid = this.db.findEntityIdByAttribute('uuid', action.context.waitingThoughtUUID);
-                        if(waitingEid) this.db.transact([{':db/id': waitingEid, ':thought/status': Status.FAILED}]);
+                        if (waitingEid) this.db.transact([{':db/id': waitingEid, ':thought/status': Status.FAILED}]);
                     }
                 }
             }
@@ -593,11 +804,11 @@ namespace ActionHandler {
             }
         }
 
-        private logEvent(targetUUID: Types.UUID | null, type: string, data: any) { /* ... */ }
+        private logEvent(targetUUID: Types.UUID | null, type: string, data: any) { /* ... */
+        }
     }
 }
-import InferenceEngine = Engine.InferenceEngine;
-import Status = Types.Status;
+
 
 // ======== Scheduler (Server-Side) ========
 namespace Scheduler {
@@ -612,67 +823,83 @@ namespace Scheduler {
             private engine: InferenceEngine,
             private handler: ActionHandler.AH,
             private tickInterval: number = 100 // Adjusted interval
-        ) { this.scheduleNextTick(); }
+        ) {
+            this.scheduleNextTick();
+        }
 
         private scheduleNextTick() {
             if (this.runState === 'paused') return;
             if (this.timeoutId) clearTimeout(this.timeoutId);
             this.timeoutId = setTimeout(async () => {
-                 if (this.runState === 'running' || this.runState === 'stepping') {
+                if (this.runState === 'running' || this.runState === 'stepping') {
                     await this.tick();
                     if (this.runState === 'stepping') this.setRunState('paused'); // Auto-pause after step
-                 }
-                 if (this.runState !== 'paused') this.scheduleNextTick();
+                }
+                if (this.runState !== 'paused') this.scheduleNextTick();
             }, this.tickInterval);
         }
 
         private async tick() {
-             if (this.isProcessing) return;
-             this.isProcessing = true;
-             try {
-                 // ... (Keep the logic to find highest priority PENDING thought) ...
-                 const pendingThoughts = this.db.query(/* ... */);
-                 if (pendingThoughts.length === 0) { this.isProcessing = false; return; }
-                 // ... (Select best thought logic) ...
-                 const triggerUUID = bestThoughtUUID;
+            if (this.isProcessing) return;
+            this.isProcessing = true;
+            try {
+                // ... (Keep the logic to find highest priority PENDING thought) ...
+                const pendingThoughts = this.db.query(/* ... */);
+                if (pendingThoughts.length === 0) {
+                    this.isProcessing = false;
+                    return;
+                }
+                // ... (Select best thought logic) ...
+                const triggerUUID = bestThoughtUUID;
 
-                 // ... (Lock thought to ACTIVE status) ...
-                 const lockTxReport = this.db.transact(/* ... */); // Triggers broadcast
-                 if (!lockTxReport) { this.isProcessing = false; return; }
+                // ... (Lock thought to ACTIVE status) ...
+                const lockTxReport = this.db.transact(/* ... */); // Triggers broadcast
+                if (!lockTxReport) {
+                    this.isProcessing = false;
+                    return;
+                }
 
-                 const inferenceResult = this.engine.infer(triggerUUID);
+                const inferenceResult = this.engine.infer(triggerUUID);
 
-                 if (inferenceResult) {
-                     // Transact results (will trigger another broadcast)
-                     if (inferenceResult.transactionData.length > 0) this.db.transact(inferenceResult.transactionData);
-                     // Enqueue actions
-                     if (inferenceResult.actions.length > 0) this.handler.enqueue(inferenceResult.actions);
-                 } else {
-                      // Revert status if inference failed
-                     this.db.transact([{ ':db/id': thoughtEid, ':thought/status': Status.PENDING }]); // Triggers broadcast
-                 }
-             } catch (error: any) { /* ... error logging ... */ }
-              finally { this.isProcessing = false; }
+                if (inferenceResult) {
+                    // Transact results (will trigger another broadcast)
+                    if (inferenceResult.transactionData.length > 0) this.db.transact(inferenceResult.transactionData);
+                    // Enqueue actions
+                    if (inferenceResult.actions.length > 0) this.handler.enqueue(inferenceResult.actions);
+                } else {
+                    // Revert status if inference failed
+                    this.db.transact([{':db/id': thoughtEid, ':thought/status': Status.PENDING}]); // Triggers broadcast
+                }
+            } catch (error: any) { /* ... error logging ... */
+            } finally {
+                this.isProcessing = false;
+            }
         }
 
         setRunState(state: 'running' | 'paused' | 'stepping') {
-             if (state === this.runState) return;
-             const previousState = this.runState;
-             this.runState = state;
-             console.log(`Scheduler state changed to: ${state}`);
-             broadcastMessage({ type: 'status_update', payload: { runState: this.runState } }); // Notify clients
-             if (state === 'running' && previousState !== 'running') this.scheduleNextTick();
-             if (state === 'paused' && this.timeoutId) clearTimeout(this.timeoutId);
+            if (state === this.runState) return;
+            const previousState = this.runState;
+            this.runState = state;
+            console.log(`Scheduler state changed to: ${state}`);
+            broadcastMessage({type: 'status_update', payload: {runState: this.runState}}); // Notify clients
+            if (state === 'running' && previousState !== 'running') this.scheduleNextTick();
+            if (state === 'paused' && this.timeoutId) clearTimeout(this.timeoutId);
         }
-        getRunState() { return this.runState; }
+
+        getRunState() {
+            return this.runState;
+        }
+
         step() {
             if (this.runState === 'paused') {
-                 console.log("Scheduler stepping...");
-                 this.runState = 'stepping'; // Tick will run once then set to paused
-                 this.scheduleNextTick();
+                console.log("Scheduler stepping...");
+                this.runState = 'stepping'; // Tick will run once then set to paused
+                this.scheduleNextTick();
             }
         }
-        stop() { /* ... clear timeout ... */ }
+
+        stop() { /* ... clear timeout ... */
+        }
     }
 }
 
@@ -680,8 +907,8 @@ namespace Scheduler {
 namespace Bootstrap {
     import Rule = Types.Rule;
     import DBInterface = Database.DBInterface;
-     // Keep getBootstrapRules() and bootstrapDB() mostly as before
-     // Ensure rules use the correct op:tool format for user_interaction
+    // Keep getBootstrapRules() and bootstrapDB() mostly as before
+    // Ensure rules use the correct op:tool format for user_interaction
     export const getBootstrapRules = (): Omit<Rule, 'createdAt' | 'modifiedAt'>[] => {
         // ... (Copy rules from previous refactor, ensuring user interaction uses the correct op)
         // Example fix for the old Rule 3 (if re-enabled):
@@ -705,7 +932,8 @@ namespace Bootstrap {
         */
         // ... other rules ...
     };
-    export const bootstrapDB = (db: DBInterface) => { /* ... implementation ... */ };
+    export const bootstrapDB = (db: DBInterface) => { /* ... implementation ... */
+    };
 }
 
 
@@ -722,6 +950,7 @@ const scheduler = new Scheduler.ExecutionScheduler(db, engine, actionHandler);
 
 // --- Persistence ---
 let autoSaveIntervalId: NodeJS.Timeout | null = null;
+
 async function initializePersistence() {
     const loaded = await db.load(DB_FILE_PATH);
     if (!loaded) {
@@ -734,7 +963,7 @@ async function initializePersistence() {
 }
 
 // --- WebSocket Server ---
-const wss = new WebSocketServer({ port: WS_PORT });
+const wss = new WebSocketServer({port: WS_PORT});
 const clients = new Set<any>(); // Store connected WebSocket clients
 
 wss.on('connection', (ws) => {
@@ -748,7 +977,7 @@ wss.on('connection', (ws) => {
             handleWebSocketMessage(ws, parsedMessage);
         } catch (e) {
             console.error('Failed to parse message or handle:', message.toString(), e);
-            ws.send(JSON.stringify({ type: 'error', payload: { message: 'Invalid message format' } }));
+            ws.send(JSON.stringify({type: 'error', payload: {message: 'Invalid message format'}}));
         }
     });
 
@@ -778,7 +1007,7 @@ function broadcastMessage(message: object) {
 
 function sendMessage(client: any, message: object) {
     if (client.readyState === WebSocket.OPEN) {
-         client.send(JSON.stringify(message));
+        client.send(JSON.stringify(message));
     }
 }
 
@@ -792,43 +1021,50 @@ function handleWebSocketMessage(ws: any, message: { type: string; payload?: any 
             if (typeof message.payload?.content === 'string' && message.payload.content.trim()) {
                 const content = message.payload.content.trim();
                 const newThoughtUUID = uuid();
-                const contentTermData = TermUtils.termToTransactionData({ kind: 'atom', name: content });
-                 // Simplified transaction for adding user thought
-                 db.transact([
-                     ...contentTermData.tx,
-                     { ':db/id': -1, ':goal/value': 0.7, ':goal/source': 'user_input', ':goal/time': new Date() },
-                     { ':db/id': -2, ':truth/pos': 1, ':truth/neg': 0 },
-                     { ':db/id': -3, uuid: newThoughtUUID, kind: ':flowmind.kind/thought',
-                       ':thought/content': contentTermData.rootId, ':thought/status': Types.Status.PENDING,
-                       ':thought/truth': -2, ':thought/goal': -1, ':thought/meta': [],
-                       createdAt: new Date(), modifiedAt: new Date() }
-                 ]); // Transaction triggers broadcast
+                const contentTermData = TermUtils.termToTransactionData({kind: 'atom', name: content});
+                // Simplified transaction for adding user thought
+                db.transact([
+                    ...contentTermData.tx,
+                    {':db/id': -1, ':goal/value': 0.7, ':goal/source': 'user_input', ':goal/time': new Date()},
+                    {':db/id': -2, ':truth/pos': 1, ':truth/neg': 0},
+                    {
+                        ':db/id': -3, uuid: newThoughtUUID, kind: ':flowmind.kind/thought',
+                        ':thought/content': contentTermData.rootId, ':thought/status': Types.Status.PENDING,
+                        ':thought/truth': -2, ':thought/goal': -1, ':thought/meta': [],
+                        createdAt: new Date(), modifiedAt: new Date()
+                    }
+                ]); // Transaction triggers broadcast
             }
             break;
         case 'user_input_response':
-             if (message.payload?.promptId && typeof message.payload?.response === 'string') {
-                 actionHandler.handleUserInputResponse(message.payload.promptId, message.payload.response);
-                 // Response handling triggers DB transaction -> broadcast
-             }
+            if (message.payload?.promptId && typeof message.payload?.response === 'string') {
+                actionHandler.handleUserInputResponse(message.payload.promptId, message.payload.response);
+                // Response handling triggers DB transaction -> broadcast
+            }
             break;
         case 'update_goal':
             if (message.payload?.thoughtUUID && typeof message.payload?.delta === 'number') {
-                 const { thoughtUUID, delta } = message.payload;
-                 const thoughtEid = db.findEntityIdByAttribute('uuid', thoughtUUID);
-                 if (thoughtEid) {
-                     const goalRef = db.pull(thoughtEid, [{':thought/goal': [':db/id', ':goal/value']}])?.[':thought/goal'];
-                     if (goalRef) {
-                         const currentValue = goalRef[':goal/value'] ?? 0.5;
-                         const newValue = Math.max(0, Math.min(1, currentValue + delta));
-                         db.transact([{ ':db/id': goalRef[':db/id'], ':goal/value': newValue, ':goal/source': 'user_adjust', ':goal/time': new Date() }]); // Triggers broadcast
-                     }
-                 }
+                const {thoughtUUID, delta} = message.payload;
+                const thoughtEid = db.findEntityIdByAttribute('uuid', thoughtUUID);
+                if (thoughtEid) {
+                    const goalRef = db.pull(thoughtEid, [{':thought/goal': [':db/id', ':goal/value']}])?.[':thought/goal'];
+                    if (goalRef) {
+                        const currentValue = goalRef[':goal/value'] ?? 0.5;
+                        const newValue = Math.max(0, Math.min(1, currentValue + delta));
+                        db.transact([{
+                            ':db/id': goalRef[':db/id'],
+                            ':goal/value': newValue,
+                            ':goal/source': 'user_adjust',
+                            ':goal/time': new Date()
+                        }]); // Triggers broadcast
+                    }
+                }
             }
             break;
         case 'control_scheduler':
             if (['run', 'pause', 'step'].includes(message.payload?.command)) {
                 scheduler.setRunState(message.payload.command);
-                 if (message.payload.command === 'step') scheduler.step();
+                if (message.payload.command === 'step') scheduler.step();
             }
             break;
         case 'request_undo':
@@ -836,60 +1072,60 @@ function handleWebSocketMessage(ws: any, message: { type: string; payload?: any 
             break;
         case 'request_save':
             db.save(DB_FILE_PATH);
-             sendMessage(ws, { type: 'status_update', payload: { message: 'Database saved.' }});
+            sendMessage(ws, {type: 'status_update', payload: {message: 'Database saved.'}});
             break;
         case 'request_load':
-             initializePersistence().then(() => {
-                 broadcastStateUpdate(); // Force update after load
-                 sendMessage(ws, { type: 'status_update', payload: { message: 'Database loaded.' }});
-             });
+            initializePersistence().then(() => {
+                broadcastStateUpdate(); // Force update after load
+                sendMessage(ws, {type: 'status_update', payload: {message: 'Database loaded.'}});
+            });
             break;
         case 'get_config':
-            sendMessage(ws, { type: 'config_update', payload: config });
+            sendMessage(ws, {type: 'config_update', payload: config});
             break;
-         case 'update_config': // Basic config update - requires validation/restart logic in real app
-              if (message.payload?.config) {
-                 console.log("Received config update request:", message.payload.config);
-                 // Naive update - in reality, need validation and possibly restart parts of the app
-                 config = { ...config, ...message.payload.config };
-                 // Re-inject config where needed (e.g., tools might need re-initialization)
-                 // This is complex without a restart. For now, just update the object.
-                 broadcastMessage({ type: 'config_update', payload: config }); // Inform all clients
-                 sendMessage(ws, { type: 'status_update', payload: { message: 'Config updated (restart may be needed).' }});
-             }
-             break;
+        case 'update_config': // Basic config update - requires validation/restart logic in real app
+            if (message.payload?.config) {
+                console.log("Received config update request:", message.payload.config);
+                // Naive update - in reality, need validation and possibly restart parts of the app
+                config = {...config, ...message.payload.config};
+                // Re-inject config where needed (e.g., tools might need re-initialization)
+                // This is complex without a restart. For now, just update the object.
+                broadcastMessage({type: 'config_update', payload: config}); // Inform all clients
+                sendMessage(ws, {type: 'status_update', payload: {message: 'Config updated (restart may be needed).'}});
+            }
+            break;
         // Add handlers for other client messages (get debug data, etc.)
         default:
             console.warn('Unknown message type received:', message.type);
-            sendMessage(ws, { type: 'error', payload: { message: `Unknown command: ${message.type}` } });
+            sendMessage(ws, {type: 'error', payload: {message: `Unknown command: ${message.type}`}});
     }
 }
 
 // --- State Broadcasting Logic ---
 function getAllThoughtsForClient(): Types.ClientThought[] {
-     const thoughtEids = db.query('[:find ?t :where [?t :kind :flowmind.kind/thought]]').map(r => r[0]);
-     const thoughtData = db.pullMany(thoughtEids, [
-         'uuid', ':thought/status',
-         { ':thought/content': ['*'] },
-         { ':thought/goal': [':goal/value', ':goal/source'] },
-         ':created_at',
-         {':thought/meta': [':meta_entry/key', ':meta_entry/value_string']} // Example meta pull
-     ]);
+    const thoughtEids = db.query('[:find ?t :where [?t :kind :flowmind.kind/thought]]').map(r => r[0]);
+    const thoughtData = db.pullMany(thoughtEids, [
+        'uuid', ':thought/status',
+        {':thought/content': ['*']},
+        {':thought/goal': [':goal/value', ':goal/source']},
+        ':created_at',
+        {':thought/meta': [':meta_entry/key', ':meta_entry/value_string']} // Example meta pull
+    ]);
 
-     return thoughtData.map((tData: any): Types.ClientThought | null => {
-         if (!tData) return null;
-         const contentTerm = TermUtils.entityToTerm(db, tData[':thought/content']?.[':db/id']);
-         const meta = Database.DBInterface.parseMeta(tData[':thought/meta'] ?? {});
-         return {
-             uuid: tData.uuid,
-             contentStr: TermUtils.simplifyTermForClient(contentTerm), // Send simplified string
-             status: tData[':thought/status']?.split('/')[1] || 'unknown',
-             goalValue: tData[':thought/goal']?.[':goal/value'] ?? 0,
-             goalSource: tData[':thought/goal']?.[':goal/source'] ?? 'unknown',
-             createdAt: (tData[':created_at'] ?? new Date(0)).toISOString(),
-             meta: Object.fromEntries(meta.entries()), // Convert map for JSON
-         };
-     }).filter(Boolean) as Types.ClientThought[];
+    return thoughtData.map((tData: any): Types.ClientThought | null => {
+        if (!tData) return null;
+        const contentTerm = TermUtils.entityToTerm(db, tData[':thought/content']?.[':db/id']);
+        const meta = Database.DBInterface.parseMeta(tData[':thought/meta'] ?? {});
+        return {
+            uuid: tData.uuid,
+            contentStr: TermUtils.simplifyTermForClient(contentTerm), // Send simplified string
+            status: tData[':thought/status']?.split('/')[1] || 'unknown',
+            goalValue: tData[':thought/goal']?.[':goal/value'] ?? 0,
+            goalSource: tData[':thought/goal']?.[':goal/source'] ?? 'unknown',
+            createdAt: (tData[':created_at'] ?? new Date(0)).toISOString(),
+            meta: Object.fromEntries(meta.entries()), // Convert map for JSON
+        };
+    }).filter(Boolean) as Types.ClientThought[];
 }
 
 function getActivePromptsForClient(): Types.ClientPrompt[] {
@@ -903,14 +1139,14 @@ function getActivePromptsForClient(): Types.ClientPrompt[] {
         // const promptData = storedPromptData.get(promptId); // Hypothetical stored data
         // const text = promptData?.text || `Missing prompt text for ${promptId}`;
         // For now, use a placeholder:
-        const text = `Input needed for ${data.waitingThoughtUUID.substring(0,8)} (ID: ${promptId.substring(0,8)})`;
+        const text = `Input needed for ${data.waitingThoughtUUID.substring(0, 8)} (ID: ${promptId.substring(0, 8)})`;
 
-         return {
-             promptId,
-             text: text, // FIXME: Need to store/retrieve original prompt text
-             waitingThoughtUUID: data.waitingThoughtUUID,
-         };
-     });
+        return {
+            promptId,
+            text: text, // FIXME: Need to store/retrieve original prompt text
+            waitingThoughtUUID: data.waitingThoughtUUID,
+        };
+    });
 }
 
 
@@ -928,12 +1164,12 @@ function broadcastStateUpdate() {
 
 function sendInitialState(ws: any) {
     const thoughts = getAllThoughtsForClient();
-     const prompts = getActivePromptsForClient();
+    const prompts = getActivePromptsForClient();
     sendMessage(ws, {
         type: 'initial_state',
         payload: {
             thoughts: thoughts.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
-             prompts: prompts,
+            prompts: prompts,
             config: config,
             runState: scheduler.getRunState()
         }
@@ -961,7 +1197,7 @@ const server = http.createServer(async (req, res) => {
         if (filePath.endsWith('.js')) contentType = 'text/javascript';
         else if (filePath.endsWith('.css')) contentType = 'text/css';
 
-        res.writeHead(200, { 'Content-Type': contentType });
+        res.writeHead(200, {'Content-Type': contentType});
         res.end(content);
     } catch (err) {
         console.error("Error reading file:", err);
@@ -976,48 +1212,6 @@ server.listen(HTTP_PORT, async () => {
     await initializePersistence(); // Load DB before starting scheduler/accepting connections
     console.log(`HTTP server listening on http://localhost:${HTTP_PORT}`);
     console.log(`WebSocket server listening on ws://localhost:${WS_PORT}`);
-scheduler.setRunState('running'); // Start the engine after setup
+    scheduler.setRunState('running'); // Start the engine after setup
 });
 
-
-//
-// ---
-//
-// **To Run This Version:**
-//
-// 1.  **Save Files:**
-//     *   Save the server code as `server.mjs`.
-//     *   Save the HTML code as `index.html`.
-//     *   Save the client JavaScript code as `client.js` in the same directory.
-// 2.  **Install Dependencies:**
-//     ```bash
-// npm init -y
-// npm install ws datascript langchain @langchain/community @langchain/core uuid
-// # No @types needed for runtime, no build tools
-//     ```
-// 3.  **Run Ollama:** Make sure your Ollama server is running (e.g., `ollama serve`).
-// 4.  **Run the Server:**
-//     ```bash
-// node server.mjs
-//     ```
-// 5.  **Access the Client:** Open your web browser and navigate to `http://localhost:3000`.
-//
-//     **Explanation of Changes:**
-//
-// *   **Server:**
-// *   Now explicitly uses `ws` for WebSocket communication and `http` for serving static files.
-// *   `DBInterface` transactions now trigger `broadcastStateUpdate`.
-// *   `UserInteractionTool` is redesigned to trigger WebSocket messages handled by `ActionHandler`.
-// *   `ActionHandler` manages pending prompts and processes responses received via WebSocket.
-// *   State preparation functions (`getAllThoughtsForClient`, `getActivePromptsForClient`) create simplified data structures suitable for sending as JSON. Terms are simplified to strings.
-// *   Persistence uses `fs` to save/load the DB to a local file.
-// *   WebSocket message handling logic maps client actions to server functions.
-// *   **Client:**
-// *   Minimal `index.html` sets up the basic structure and includes `client.js`.
-// *   `client.js` uses vanilla DOM manipulation (`document.getElementById`, `createElement`, `innerHTML`, `appendChild`, etc.) to build and update the UI.
-// *   Connects to the WebSocket server, handles messages (`onmessage`), and manages connection state (open, close, error, reconnect attempts).
-// *   Rendering functions (`renderThoughts`, `renderPrompts`, etc.) take data received from the server and update the corresponding DOM sections.
-// *   Event listeners on buttons/inputs send messages back to the server via WebSocket.
-// *   Basic CSS provides layout and styling without a framework.
-//
-//     This architecture separates the complex state management and heavy processing (LLM calls, inference) onto the server, while the client remains lightweight, focusing purely on presentation and user interaction via the WebSocket protocol.
