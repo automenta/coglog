@@ -143,7 +143,7 @@ namespace Terms {
             case 'Variable': return c(chalk.cyan, `?${term.name}`);
             case 'Struct': return `${c(chalk.yellow, term.name)}(${term.args.map(t => format(t, useColor)).join(', ')})`;
             case 'List': return `[${term.elements.map(t => format(t, useColor)).join(', ')}]`;
-            default: const _: never = term; return c(chalk.red, 'invalid_term');
+            default: return c(chalk.red, 'invalid_term');
         }
     }
 
@@ -153,7 +153,8 @@ namespace Terms {
             case 'Variable': return `?${term.name}`;
             case 'Struct': return `${term.name}(${term.args.map(toString).join(',')})`;
             case 'List': return `[${term.elements.map(toString).join(',')}]`;
-            default: const _: never = term; return '';
+            default:
+                return '';
         }
     }
 
@@ -173,7 +174,7 @@ namespace Terms {
             }
             if (currentArg.trim()) args.push(fromString(currentArg.trim())); return Struct(name, args);
         }
-        const listMatch = input.match(/^\[(.*)\]$/);
+        const listMatch = input.match(/^\[(.*)]$/);
         if (listMatch) {
             const elementsStr = listMatch[1]; const elements: Term[] = [];
             let currentEl = ''; let parenLevel = 0; let bracketLevel = 0;
@@ -233,7 +234,8 @@ namespace Terms {
                     const result = unify(t1.elements[i], l2.elements[i], currentBindings);
                     if (!result) return null; currentBindings = result;
                 } return currentBindings;
-            } default: const _: never = t1; return null;
+            } default:
+                return null;
         }
     }
 
