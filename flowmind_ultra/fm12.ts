@@ -1,3 +1,69 @@
+// ### Additional Bootstrap Rules
+//
+// 1.  **Self-Correction on Failure:**
+// *   **Description:** When a thought fails (`FAILED` status, triggering the `failure` log thought), attempt a recovery action instead of just asking the user immediately.
+// *   **Pattern:** `Log(failure(thoughtId(?FailedId), content(?FailedContent), error(?ErrorMsg)))`
+// *   **Action:** `LLMTool(generate, 'GENERATE_RECOVERY_STRATEGY', context(failedId:?FailedId, failedContent:?FailedContent, error:?ErrorMsg))` *OR* `CoreTool(set_status, ?FailedId, 'PENDING')` (for a simple retry rule) *OR* try finding an alternative existing Strategy if the failed thought was an Outcome.
+// *   **Priority:** Medium (e.g., 40) - lower than the "Ask How to Handle Failure" rule, allowing automatic attempts first.
+//
+// 2.  **Stuck Thought Detection:**
+// *   **Description:** Periodically check for thoughts that have been `PENDING` or `WAITING` for an unusually long time and prompt for action. (Requires a TimeTool).
+// *   **Pattern:** `System(tick)` (Assuming a `System(tick)` thought is generated periodically by a TimeTool) *AND* a way to query thoughts by status and age (potentially via a CoreTool enhancement or a dedicated QueryTool).
+// *   **Action:** `UserInteractionTool(prompt, 'STUCK_THOUGHT_PROMPT', context(thoughtId:?StuckId, status:?StuckStatus, age:?StuckAge))`
+// *   **Priority:** Very Low (e.g., -50)
+//
+// 3.  **Input Clarification (More Specific):**
+// *   **Description:** If input is very short or seems ambiguous (e.g., contains only common words), trigger clarification *before* attempting goal generation.
+// *   **Pattern:** `Input(?Content)` where `?Content` is determined to be potentially ambiguous (e.g., `Atom` with short length, needs a helper function or predicate in the pattern matcher, which isn't directly supported here - might need a preliminary rule/tool to tag thoughts as 'ambiguous').
+// *   **Action:** `UserInteractionTool(prompt, 'CLARIFY_INPUT', context(input:?Content))`
+// *   **Priority:** Higher than default `Input` -> `GENERATE_GOAL` fallback (e.g., 5).
+//
+// 4.  **Task Completion Cleanup/Review:**
+// *   **Description:** When a root Goal thought becomes `DONE`, trigger a final review or summary action.
+// *   **Pattern:** `Goal(?GoalContent)` where the thought's status becomes `DONE` and `metadata.rootId == id`. (Requires status change trigger mechanism or periodic check).
+// *   **Action:** `LLMTool(generate, 'SUMMARIZE_TASK_COMPLETION', context(goalId:?SelfId, goalContent:?GoalContent))` *OR* `CoreTool(add_thought, 'LOG', 'Task ?SelfId completed.')`
+// *   **Priority:** High (e.g., 100) - run immediately upon completion.
+//
+// ### Additional Tools
+//
+// 1.  **TimeTool:**
+// *   **Name:** `TimeTool`
+// *   **Description:** Provides time-related functions: `get_time()`, `wait(duration)`, `schedule(action, time)`, `periodic_tick(interval)`.
+// *   **Execute:** Returns current time, pauses execution (carefully, maybe creates a `WAITING` thought scheduled for later), creates future scheduled thoughts, or generates periodic `System(tick)` thoughts. This enables scheduling and checking for stalled thoughts.
+//
+// 2.  **FileSystemTool:**
+// *   **Name:** `FileSystemTool`
+// *   **Description:** Interacts with the local filesystem: `read_file(path)`, `write_file(path, content)`, `list_dir(path)`.
+// *   **Execute:** Reads/writes files, allowing the system to ingest external documents or save structured output beyond the main state file. Use with caution regarding security.
+//
+// 3.  **WebSearchTool:**
+// *   **Name:** `WebSearchTool`
+// *   **Description:** Performs web searches: `search(query, num_results)`.
+// *   **Execute:** Uses an external search API (e.g., SerpApi, Google Search API) to fetch search results, allowing the system to incorporate external, up-to-date information. Requires API keys and potentially LangChain integration wrappers.
+//
+// 4.  **ContextSummarizationTool:**
+// *   **Name:** `ContextSummarizer`
+// *   **Description:** Summarizes the history or relevant parts of a task: `summarize(rootId, max_tokens)`.
+// *   **Execute:** Retrieves descendant thoughts for a `rootId`, potentially filters them (e.g., Facts, Outcomes), and uses the LLM to generate a concise summary. Useful for providing context to LLM prompts without exceeding limits.
+//
+// 5.  **RuleManagementTool:**
+// *   **Name:** `RuleManager`
+// *   **Description:** Allows programmatic manipulation of rules: `add_rule(pattern, action, priority?, description?)`, `delete_rule(ruleId)`, `modify_priority(ruleId, delta)`.
+// *   **Execute:** Adds, deletes, or modifies rules in the `RuleStore`. Enables self-modification based on performance or user feedback (use with extreme caution).
+//
+// ### Additional Prompts (PromptRegistry)
+//
+// 1.  **`GENERATE_RECOVERY_STRATEGY`**:
+// *   `"Thought {failedId} ('{failedContent}') failed with error: '{error}'. Suggest a concise alternative strategy or action to achieve the original goal (if discernible). Output ONLY the suggested action/strategy text."`
+// 2.  **`STUCK_THOUGHT_PROMPT`**:
+// *   `"Thought {thoughtId} has been in status '{status}' for {age}. What should be done? (Options: retry / mark_failed / investigate / ignore)"`
+// 3.  **`SUMMARIZE_TASK_COMPLETION`**:
+// *   `"Task goal '{goalContent}' (ID: {goalId}) is complete. Based on its associated thoughts (Outcomes, Facts, Logs), provide a brief summary of what was accomplished and any key findings."` (Requires ContextSummarizer tool or passing context).
+// 4.  **`ASK_FOR_RULE_SUGGESTION`**:
+// *   `"Processing pattern '{pattern}' led to failure '{error}' multiple times. Can you suggest a better rule (pattern -> action) to handle this situation more effectively?"` (Could be triggered by RuleManagementTool or analysis).
+//
+// These additions would enhance the system's ability to handle failures autonomously, manage tasks over time, interact with external information, and potentially learn or adapt its own rules, significantly boosting its overall capability. Remember to implement new tools carefully, especially those interacting with external systems or modifying core components like rules.
+
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
@@ -31,7 +97,6 @@ const SHORT_ID_LEN = 6;
 const WS_PORT = 8080;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'; // 'debug', 'info', 'warn', 'error'
 
-// --- Types ---
 enum Status { PENDING = 'PENDING', ACTIVE = 'ACTIVE', WAITING = 'WAITING', DONE = 'DONE', FAILED = 'FAILED' }
 enum Type {
     INPUT = 'INPUT', GOAL = 'GOAL', STRATEGY = 'STRATEGY', OUTCOME = 'OUTCOME',
